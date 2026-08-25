@@ -764,6 +764,72 @@ impl IdMapIndex {
         self.inner.bit_width()
     }
 
+    // ---- pg_turbovec 2.0.0 fork carry #2 (parts API) ----
+    // 1.0.0 sealed `inner` (private, no accessor) and dropped the
+    // part getters + `from_id_map_parts*` the old fork exposed.
+    // pg_turbovec's relfile persist path reads parts directly off a
+    // built/mutated IdMapIndex, and its aminsert path must
+    // reconstruct a mutable IdMapIndex from persisted parts, mutate
+    // it, and read the parts back. Re-expose exactly what that needs,
+    // as thin delegations to the inner TurboQuantIndex. Same fork-carry
+    // spirit as `pack::repack` being re-`pub`'d. FLAG: upstream ask to
+    // provide a parts accessor so this carry can be dropped.
+
+    /// Borrow the inner row-major packed bit-plane codes.
+    pub fn packed_codes(&self) -> &[u8] {
+        self.inner.packed_codes()
+    }
+
+    /// Borrow the per-vector scales.
+    pub fn scales(&self) -> &[f32] {
+        self.inner.scales()
+    }
+
+    /// Borrow the slot -> external id table.
+    pub fn slot_to_id(&self) -> &[u64] {
+        &self.slot_to_id
+    }
+
+    /// Borrow the TQ+ per-coordinate shift (empty when uncalibrated).
+    pub fn tqplus_shift(&self) -> &[f32] {
+        self.inner.tqplus_shift()
+    }
+
+    /// Borrow the TQ+ per-coordinate scale (empty when uncalibrated).
+    pub fn tqplus_scale(&self) -> &[f32] {
+        self.inner.tqplus_scale()
+    }
+
+    /// Build an `IdMapIndex` from already-decoded raw parts + the
+    /// TQ+ calibration arrays. The 1.0.0 codebook and rotation are
+    /// deterministic functions of `(bit_width, dim)`, so only the
+    /// codes, scales, slot table, and TQ+ arrays are persisted by the
+    /// embedder; everything else is rebuilt by `prepare`. TQ+ arrays
+    /// may be empty (identity / uncalibrated).
+    pub fn from_id_map_parts(
+        bit_width: usize,
+        dim: usize,
+        n_vectors: usize,
+        packed_codes: Vec<u8>,
+        scales: Vec<f32>,
+        slot_to_id: Vec<u64>,
+        tqplus_shift: Vec<f32>,
+        tqplus_scale: Vec<f32>,
+    ) -> std::io::Result<Self> {
+        let dim_opt = if dim == 0 { None } else { Some(dim) };
+        let inner = TurboQuantIndex::from_parts(
+            dim_opt,
+            bit_width,
+            n_vectors,
+            packed_codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+        Self::from_index_and_ids(inner, slot_to_id)
+    }
+
     /// Eagerly populate the inner search caches **and** the lazy
     /// id → slot map. See [`TurboQuantIndex::prepare`].
     ///
