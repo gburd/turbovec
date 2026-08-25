@@ -56,7 +56,13 @@ macro_rules! pack_blocked_native {
 /// bounds — construct through
 /// [`from_parts`](crate::TurboQuantIndex::from_parts) instead, which
 /// validates these before the blocked layout is ever built.
-pub(crate) fn repack(
+// pg_turbovec fork carry (2.0.0 port): re-exposed `pub` so the
+// PostgreSQL extension can recompute the SIMD-blocked layout from the
+// row-major `packed_codes()` at index-open (it persists only the packed
+// codes, halving the on-disk footprint, and rebuilds `blocked` per
+// backend). Upstream 1.0.0 has this `pub(crate)`; this is the sole
+// fork delta vs stock turbovec 1.0.0. Signature unchanged.
+pub fn repack(
     packed_codes: &[u8],
     n_vectors: usize,
     bits: usize,
