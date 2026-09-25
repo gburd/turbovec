@@ -62,20 +62,64 @@ macro_rules! pack_blocked_native {
 // codes, halving the on-disk footprint, and rebuilds `blocked` per
 // backend). Upstream 1.0.0 has this `pub(crate)`; this is the sole
 // fork delta vs stock turbovec 1.0.0. Signature unchanged.
+//
+// pg_turbovec fork carry #3 (parallel cold-open repack): the body now
+// splits the block space into block-aligned ranges and repacks them in
+// parallel via [`repack_block_range`], concatenating the results.
+// Because block `i`'s output occupies exactly the disjoint byte range
+// `[i * n_byte_groups * BLOCK, (i+1) * n_byte_groups * BLOCK)` and
+// depends only on rows `[i*BLOCK, (i+1)*BLOCK)`, the concatenation is
+// BYTE-IDENTICAL to the serial repack (pinned by
+// `parallel_repack_is_byte_identical_to_serial`). This is a speed
+// change only — every pg_turbovec backend pays this repack once at cold
+// index-open, and it dominated the measured cold-scan latency
+// (`pg_turbovec benches/results/rebench_20260925/`, item 2). Serial
+// below a threshold where thread-spawn overhead dominates.
 pub fn repack(
     packed_codes: &[u8],
     n_vectors: usize,
     bits: usize,
     dim: usize,
 ) -> (Vec<u8>, usize) {
+    use rayon::prelude::*;
     let (n_blocks, n_byte_groups, blocked_size) = blocked_geometry(n_vectors, bits, dim);
 
-    // Step 1: Extract packed nibble bytes per vector per group
-    let codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
+    // Below this the serial path is faster (thread-spawn + join overhead
+    // dominates); mirrors the `apply_native_transform` PAR_THRESHOLD.
+    const PAR_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+    // Blocks per parallel task. A block is `n_byte_groups * BLOCK` output
+    // bytes; grouping ~64 blocks/task keeps tasks coarse enough to amortize
+    // scheduling while giving rayon plenty to balance across cores.
+    const BLOCKS_PER_TASK: usize = 64;
 
-    // Step 2: Pack into platform-specific layout
-    let blocked =
-        pack_blocked_native!(n_vectors, n_blocks, bits, n_byte_groups, blocked_size, &codes_flat);
+    if blocked_size < PAR_THRESHOLD_BYTES || n_blocks <= 1 {
+        // Step 1: extract packed nibble bytes per vector per group.
+        let codes_flat = extract_codes_flat(packed_codes, n_vectors, bits, dim);
+        // Step 2: pack into platform-specific layout.
+        let blocked = pack_blocked_native!(
+            n_vectors, n_blocks, bits, n_byte_groups, blocked_size, &codes_flat);
+        return (blocked, n_blocks);
+    }
+
+    let bytes_per_block = n_byte_groups * BLOCK;
+    let n_tasks = n_blocks.div_ceil(BLOCKS_PER_TASK);
+    let mut blocked = vec![0u8; blocked_size];
+    // Each output chunk is exactly BLOCKS_PER_TASK blocks (the last is
+    // shorter). `repack_block_range` produces bytes identical to the full
+    // repack for its range, so writing each range into its slot yields the
+    // serial result exactly.
+    blocked
+        .par_chunks_mut(BLOCKS_PER_TASK * bytes_per_block)
+        .enumerate()
+        .for_each(|(task, out)| {
+            let block_start = task * BLOCKS_PER_TASK;
+            let block_end = ((task + 1) * BLOCKS_PER_TASK).min(n_blocks);
+            debug_assert!(task < n_tasks);
+            let part = repack_block_range(
+                packed_codes, n_vectors, bits, dim, block_start, block_end);
+            debug_assert_eq!(part.len(), out.len(), "repack task {task} size mismatch");
+            out.copy_from_slice(&part);
+        });
     (blocked, n_blocks)
 }
 
@@ -1442,6 +1486,85 @@ mod vector_major_tests {
                 assert_eq!(buf[at], (j * BLOCK + v) as u8, "j={j} v={v}");
             }
         }
+    }
+
+    /// Serial reference repack (the pre-fork-carry-#3 body): extract then
+    /// pack the whole thing in one shot. Kept in the test module so the
+    /// parallel `repack` has an independent oracle. `pack_blocked_native!`
+    /// is an in-crate `macro_rules!` visible here by bare name.
+    fn repack_serial_reference(
+        packed_codes: &[u8],
+        n_vectors: usize,
+        bits: usize,
+        dim: usize,
+    ) -> (Vec<u8>, usize) {
+        let (n_blocks, n_byte_groups, blocked_size) =
+            super::blocked_geometry(n_vectors, bits, dim);
+        let codes_flat = super::extract_codes_flat(packed_codes, n_vectors, bits, dim);
+        let blocked = pack_blocked_native!(
+            n_vectors, n_blocks, bits, n_byte_groups, blocked_size, &codes_flat);
+        (blocked, n_blocks)
+    }
+
+    /// The load-bearing guard for fork carry #3: the parallel `repack`
+    /// MUST produce byte-identical output to the serial reference for
+    /// every shape — including shapes that cross the parallel threshold
+    /// and shapes whose final block is partially padded. A single wrong
+    /// byte here is a silently mis-scored index at cold-open, so this is
+    /// asserted byte-for-byte, not via a round-trip.
+    ///
+    /// Covers: sub-threshold (serial path taken), above-threshold (rayon
+    /// path), n_vectors NOT a multiple of BLOCK (tail padding), n_vectors
+    /// NOT a multiple of BLOCKS_PER_TASK*BLOCK (partial last task), and
+    /// all supported bit widths.
+    #[test]
+    fn parallel_repack_is_byte_identical_to_serial() {
+        // dim multiple of 8; a big enough dim so a moderate n crosses the
+        // 4 MiB parallel threshold (blocked_size = n_blocks * (dim/cpb) * 32).
+        let cases = [
+            // (n_vectors, bits, dim)
+            (1usize, 4usize, 64usize),      // single block, sub-threshold
+            (31, 4, 64),                    // partial single block
+            (32, 4, 64),                    // exactly one full block
+            (33, 4, 64),                    // spills to a 2nd block, padded
+            (1000, 2, 128),                 // small, sub-threshold
+            (1000, 3, 96),                  // 3-bit, sub-threshold
+            (5000, 4, 512),                 // ~ crosses threshold
+            (70_000, 4, 1024),              // well above threshold, many tasks
+            (70_001, 4, 1024),              // above threshold + tail padding
+            (66_000, 2, 256),               // 2-bit above threshold
+            (66_000, 3, 192),               // 3-bit above threshold
+        ];
+        for (n, bits, dim) in cases {
+            let packed = local_pseudo_random_packed(n, bits, dim);
+            let (par, par_nb) = super::repack(&packed, n, bits, dim);
+            let (seq, seq_nb) = repack_serial_reference(&packed, n, bits, dim);
+            assert_eq!(par_nb, seq_nb, "n_blocks mismatch for n={n} bits={bits} dim={dim}");
+            assert_eq!(
+                par.len(),
+                seq.len(),
+                "blocked len mismatch for n={n} bits={bits} dim={dim}"
+            );
+            assert!(
+                par == seq,
+                "parallel repack != serial for n={n} bits={bits} dim={dim} \
+                 (first diff at {:?})",
+                par.iter().zip(&seq).position(|(a, b)| a != b)
+            );
+        }
+    }
+
+    /// Local packed-code generator (this module can't see `tests::
+    /// pseudo_random_packed`); an LCG byte stream of the right length.
+    fn local_pseudo_random_packed(n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
+        let bytes_per_row = bits * dim / 8;
+        let mut s = 0x9E37_79B9u32;
+        (0..n_vectors * bytes_per_row)
+            .map(|_| {
+                s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                (s >> 24) as u8
+            })
+            .collect()
     }
 }
 
