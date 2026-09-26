@@ -11,6 +11,9 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### Added (Rust crate)
+- `IdMapIndex` persist-and-reconstruct 'parts' API: `packed_codes()`, `scales()`, `slot_to_id()`, `tqplus_shift()`, `tqplus_scale()` accessors and `from_id_map_parts(...)`. Closes #547.
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the
