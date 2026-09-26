@@ -11,6 +11,9 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### Changed (Rust crate)
+- `pack::repack` is now `pub` (was `pub(crate)`), so storage-backed consumers that persist only the row-major packed codes can rebuild the SIMD-blocked layout at load time. Closes #546.
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the
