@@ -11,6 +11,9 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### Changed (Rust crate)
+- `pack::repack` now parallelizes the row-major → SIMD-blocked transform over block-aligned ranges (byte-identical to the serial path, pinned by `parallel_repack_is_byte_identical_to_serial`), mirroring `apply_native_transform`. Closes #545. Also re-exposes `pack::repack` as `pub` (#546).
+
 ## turbovec 1.0.0 (Python package) + turbovec 1.0.0 (Rust crate) — 2026-08-18
 
 First stable release, and the two packages are now on one version — the
