@@ -1863,21 +1863,29 @@ pub(crate) fn planes_repack(
         return planes_repack_serial(packed_codes, n_vectors, bits, dim);
     }
     let n_tasks = n_blocks.div_ceil(BLOCKS_PER_TASK);
-    let parts: Vec<(Vec<u8>, Vec<u8>)> = (0..n_tasks)
-        .into_par_iter()
-        .map(|t| {
+    // Write each task's output straight into its slot (as carry #3 does):
+    // block i's sign bytes are `[i*nsg*BLOCK, (i+1)*nsg*BLOCK)` and its
+    // low rows `[i*BLOCK*low_row, ..)`, so the per-task chunks of both
+    // regions are disjoint and in order. A serial concatenation of the
+    // parts instead cost ~100 ms at 1M x 1024-d (measured on Graviton4).
+    let nsg = dim / 8;
+    let low_row = (bits - 1) * nsg;
+    let mut sign = vec![0u8; n_blocks * nsg * BLOCK];
+    let mut low = vec![0u8; n_vectors * low_row];
+    let sign_task = BLOCKS_PER_TASK * nsg * BLOCK;
+    let low_task = BLOCKS_PER_TASK * BLOCK * low_row;
+    sign.par_chunks_mut(sign_task)
+        .zip(low.par_chunks_mut(low_task))
+        .enumerate()
+        .for_each(|(t, (s_out, l_out))| {
+            debug_assert!(t < n_tasks);
             let start = t * BLOCKS_PER_TASK;
             let end = ((t + 1) * BLOCKS_PER_TASK).min(n_blocks);
-            planes_repack_block_range(packed_codes, n_vectors, bits, dim, start, end)
-        })
-        .collect();
-    let (s_len, l_len) = parts.iter().fold((0, 0), |(s, l), p| (s + p.0.len(), l + p.1.len()));
-    let mut sign = Vec::with_capacity(s_len);
-    let mut low = Vec::with_capacity(l_len);
-    for (s, l) in parts {
-        sign.extend_from_slice(&s);
-        low.extend_from_slice(&l);
-    }
+            let (s, l) = planes_repack_block_range(packed_codes, n_vectors, bits, dim, start, end);
+            debug_assert_eq!((s.len(), l.len()), (s_out.len(), l_out.len()), "planes task {t}");
+            s_out.copy_from_slice(&s);
+            l_out.copy_from_slice(&l);
+        });
     (sign, low, n_blocks)
 }
 
