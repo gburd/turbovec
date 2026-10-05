@@ -1554,6 +1554,35 @@ mod vector_major_tests {
         }
     }
 
+    /// The load-bearing guard for fork carry #4: the parallel
+    /// `planes_repack` MUST equal the upstream serial body byte for byte,
+    /// for 2 and 4 bits, below/above the parallel threshold, with a padded
+    /// tail block and a partial last task. A wrong byte here is a
+    /// mis-scored index at cold-open on every staged-search host.
+    #[test]
+    fn parallel_planes_repack_is_byte_identical_to_serial() {
+        let cases = [
+            (1usize, 4usize, 128usize),
+            (33, 4, 128),
+            (5000, 2, 512),
+            (40_000, 4, 1024),   // above threshold, many tasks
+            (40_001, 4, 1024),   // + tail padding
+            (70_017, 4, 768),    // partial last task
+            (66_000, 2, 1024),   // 2-bit above threshold
+            (66_001, 2, 384),
+        ];
+        for (n, bits, dim) in cases {
+            let packed = local_pseudo_random_packed(n, bits, dim);
+            let par = super::planes_repack(&packed, n, bits, dim);
+            let seq = super::planes_repack_serial(&packed, n, bits, dim);
+            assert_eq!(par.2, seq.2, "n_blocks n={n} bits={bits} dim={dim}");
+            assert!(par.0 == seq.0, "sign region differs n={n} bits={bits} dim={dim} at {:?}",
+                par.0.iter().zip(&seq.0).position(|(a, b)| a != b));
+            assert!(par.1 == seq.1, "low region differs n={n} bits={bits} dim={dim} at {:?}",
+                par.1.iter().zip(&seq.1).position(|(a, b)| a != b));
+        }
+    }
+
     /// Local packed-code generator (this module can't see `tests::
     /// pseudo_random_packed`); an LCG byte stream of the right length.
     fn local_pseudo_random_packed(n_vectors: usize, bits: usize, dim: usize) -> Vec<u8> {
@@ -1809,7 +1838,51 @@ pub(crate) fn planes_slot(g: usize, lane: usize) -> usize {
 }
 
 /// Packed bit-plane rows -> (sign region, low region, n_blocks).
+///
+/// pg_turbovec fork carry #4 (parallel planes cold-open): on a host that
+/// takes the planes layout this, not [`repack`], builds the search cache
+/// at index-open, so carry #3's parallel repack would no longer cover the
+/// cold path. Same construction as carry #3: block `i`'s sign bytes and
+/// low rows depend only on rows `[i*BLOCK, (i+1)*BLOCK)`, so the block
+/// space is split into ranges, each rebuilt by
+/// [`planes_repack_block_range`] and concatenated. BYTE-IDENTICAL to the
+/// serial body (kept as [`planes_repack_serial`], pinned by
+/// `parallel_planes_repack_is_byte_identical_to_serial`).
 pub(crate) fn planes_repack(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+) -> (Vec<u8>, Vec<u8>, usize) {
+    use rayon::prelude::*;
+    // Same threshold / task grain as carry #3's `repack`.
+    const PAR_THRESHOLD_BYTES: usize = 4 * 1024 * 1024;
+    const BLOCKS_PER_TASK: usize = 64;
+    let n_blocks = n_vectors.div_ceil(BLOCK);
+    if n_vectors * bits * (dim / 8) < PAR_THRESHOLD_BYTES || n_blocks <= BLOCKS_PER_TASK {
+        return planes_repack_serial(packed_codes, n_vectors, bits, dim);
+    }
+    let n_tasks = n_blocks.div_ceil(BLOCKS_PER_TASK);
+    let parts: Vec<(Vec<u8>, Vec<u8>)> = (0..n_tasks)
+        .into_par_iter()
+        .map(|t| {
+            let start = t * BLOCKS_PER_TASK;
+            let end = ((t + 1) * BLOCKS_PER_TASK).min(n_blocks);
+            planes_repack_block_range(packed_codes, n_vectors, bits, dim, start, end)
+        })
+        .collect();
+    let (s_len, l_len) = parts.iter().fold((0, 0), |(s, l), p| (s + p.0.len(), l + p.1.len()));
+    let mut sign = Vec::with_capacity(s_len);
+    let mut low = Vec::with_capacity(l_len);
+    for (s, l) in parts {
+        sign.extend_from_slice(&s);
+        low.extend_from_slice(&l);
+    }
+    (sign, low, n_blocks)
+}
+
+/// The upstream (serial) body of [`planes_repack`]; the oracle for carry #4.
+pub(crate) fn planes_repack_serial(
     packed_codes: &[u8],
     n_vectors: usize,
     bits: usize,
