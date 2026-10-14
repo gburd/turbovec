@@ -6,7 +6,8 @@
 
 use statrs::distribution::{Beta, ContinuousCDF, Continuous};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::{Mutex, MutexGuard, TryLockError};
+use std::time::{Duration, Instant};
 
 /// Memo backing [`codebook`]; `None` until the first solve is stored,
 /// because `HashMap::new` is not `const`.
@@ -32,6 +33,49 @@ use std::sync::Mutex;
 /// the shape space (`3 × MAX_DIM`) is far too large to reserve statically.
 static MEMO: Mutex<Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>> = Mutex::new(None);
 
+type Memo = Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>;
+
+/// How long [`memo_lock`] keeps retrying a contended [`MEMO`] before
+/// treating it as a miss.
+///
+/// pg_turbovec fork carry #6. A single failed `try_lock` used to be a miss,
+/// and a miss is a full solve, so a *warm* memo under contention re-solved:
+/// with 4 threads asking for the same warm shape at once, 16% of calls took
+/// 25-100 ms instead of microseconds (8 threads: 25%, worst 124 ms).
+/// pg_turbovec's out-of-core IVF scan builds a throwaway index per chunk per
+/// query, so every query with >= 3 chunks paid it -- a p95 of ~100 ms over a
+/// p50 of 16 ms.
+///
+/// A live holder keeps the lock for one hash lookup, clone or insert, i.e.
+/// microseconds, so retrying for this long always gets it. A holder that
+/// no longer exists (the inherited-across-`fork` case in [`MEMO`]'s doc)
+/// never releases it; the caller then gives up after this bound and solves,
+/// which is the old behaviour plus 10 ms, and can still never hang.
+const MEMO_PATIENCE: Duration = Duration::from_millis(10);
+
+/// `MEMO`, retried for at most [`MEMO_PATIENCE`]. `None` means "treat as a
+/// miss": the lock stayed held, or a holder panicked (poisoned).
+fn memo_lock() -> Option<MutexGuard<'static, Memo>> {
+    let start = Instant::now();
+    loop {
+        match MEMO.try_lock() {
+            Ok(guard) => return Some(guard),
+            Err(TryLockError::Poisoned(_)) => return None,
+            Err(TryLockError::WouldBlock) => {
+                if start.elapsed() > MEMO_PATIENCE {
+                    return None;
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
+}
+
+/// Every Lloyd-Max solve, by shape, so a test can tell a memo hit from a
+/// re-solve without timing anything.
+#[cfg(test)]
+static SOLVES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
 /// Returns (boundaries, centroids) for the given bit width and dimension.
 ///
 /// Crate-internal: trusts `bits ∈ {2,3,4}` and `dim >= 2`. Callers reach it
@@ -48,7 +92,7 @@ static MEMO: Mutex<Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>> = Mute
 /// of the same shape, or saving, used to pay it again. See [`MEMO`] for
 /// why the memo is never taken with a blocking `lock()`.
 pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
-    if let Ok(memo) = MEMO.try_lock() {
+    if let Some(memo) = memo_lock() {
         if let Some(hit) = memo.as_ref().and_then(|m| m.get(&(bits, dim))) {
             return hit.clone();
         }
@@ -57,8 +101,10 @@ pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
     // across a hash lookup or a clone, so the window a fork could land
     // in is nanoseconds wide even though `try_lock` makes landing in it
     // harmless.
+    #[cfg(test)]
+    SOLVES.lock().unwrap_or_else(|e| e.into_inner()).push((bits, dim));
     let computed = lloyd_max(bits, dim, 200, 1e-12);
-    if let Ok(mut memo) = MEMO.try_lock() {
+    if let Some(mut memo) = memo_lock() {
         memo.get_or_insert_with(HashMap::new)
             .insert((bits, dim), computed.clone());
     }
@@ -296,6 +342,48 @@ mod fork_safety_tests {
         );
     }
 
+    /// Fork carry #6: concurrent lookups of a WARM shape must all be memo
+    /// hits. Before the bounded retry, a lookup that lost the `try_lock`
+    /// race re-solved (25-100 ms); 8 threads x 40 rounds re-solved this shape
+    /// dozens of times. Counted, not timed.
+    #[test]
+    fn warm_codebook_is_never_resolved_under_contention() {
+        use std::sync::{Arc, Barrier};
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let shape = (3usize, 1999usize); // used by no other test
+        let _ = super::codebook(shape.0, shape.1); // warm
+        let solves = || {
+            super::SOLVES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&s| s == shape)
+                .count()
+        };
+        let before = solves();
+        for _ in 0..40 {
+            let barrier = Arc::new(Barrier::new(8));
+            let threads: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        barrier.wait();
+                        super::codebook(shape.0, shape.1)
+                    })
+                })
+                .collect();
+            for t in threads {
+                t.join().expect("codebook thread");
+            }
+        }
+        assert_eq!(
+            solves() - before,
+            0,
+            "a warm codebook was re-solved under contention (a lost try_lock \
+             was treated as a memo miss)"
+        );
+    }
+
     /// The memo must still be a memo: a repeat of a shape already solved
     /// costs a hash lookup and a clone, not another Lloyd-Max solve.
     #[test]
@@ -315,3 +403,4 @@ mod fork_safety_tests {
         );
     }
 }
+
