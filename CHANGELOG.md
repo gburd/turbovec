@@ -11,6 +11,53 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+## turbovec 1.1.2 (Python package) + turbovec 1.1.2 (Rust crate) — 2026-10-06
+
+The staged search that 1.1.0 made the default lost recall on embeddings
+whose vectors share a strong common direction — common among
+open-source and domain-tuned models (#562). On MedCPT (PubMed, d=768,
+100K) at 4-bit, k=10 recall was 0.931 against the whole-index scan's
+0.944, and the true nearest neighbour was sometimes missing; it is now
+0.943, and recall is within 0.1% of the scan's at k = 1, 10 and 100 at
+both bit widths. OpenAI-class corpora return the same ids as before.
+
+The cost is in the stage widths: on a laptop, 4-bit search is within 3%
+of 1.1.1 and 2-bit is 7-12% slower at k = 10 and 2-5% slower from
+k = 32. The README's benchmark figures predate this release and are
+refreshed from the benchmark machines in a later release.
+
+### turbovec — Rust crate (current: 1.1.1 → next: 1.1.2)
+
+#### Fixed
+
+- **The staged search's first stage ranks correctly on bunched corpora.**
+  (#562) On a calibrated index the sign-plane scan now ranks against the
+  query pulled halfway toward the coordinates' centre; the sign estimate
+  of a score carried a term from the corpus's shared direction that is
+  near-constant across a query's neighbours and swamped the part that
+  tells them apart. On MedCPT (PubMed, d=768, 100K) at k=10 the staged
+  search returned the whole-index scan's ids for 82.6% of queries and
+  recall10@10 was 0.931 against the scan's 0.944; now 99.1% and 0.943,
+  and the true nearest neighbour is no longer dropped. The later stages
+  are wider at small k so recall stays within 0.1% of the whole-index
+  scan's at k = 1, 10 and 100 at both bit widths on that corpus: the
+  4-bit first ranking keeps `max(256, 6k)` (was 96) and rescores
+  `max(64, 1.5k)` (was 32); the 2-bit shortlist is `max(384, 16k)` (was
+  `max(128, 12.8k)`) and its rescore `max(64, 2k)`. One query on a pool
+  now keeps its second ranking pass and its rescore on the calling
+  thread unless the work (candidates times row bytes) reaches what the
+  pool was tuned for at d = 1536, where nothing changes. OpenAI is
+  unchanged (100% at every k). Cost on one thread: 4-bit within 3%,
+  2-bit 7-12% at k = 10 and 2-5% from k = 32. The search cache holds one
+  more float per vector; files are unchanged.
+
+### turbovec — Python package (current: 1.1.1 → next: 1.1.2)
+
+#### Fixed
+
+- **The staged search's first stage ranks correctly on bunched corpora.**
+  (#562) See the crate entry.
+
 ## turbovec 1.1.1 (Python package) + turbovec 1.1.1 (Rust crate) — 2026-10-04
 
 Two fixes for masked search on indexes of 32,768 vectors or more, both
