@@ -50,7 +50,10 @@ type Memo = Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>;
 /// microseconds, so retrying for this long always gets it. A holder that
 /// no longer exists (the inherited-across-`fork` case in [`MEMO`]'s doc)
 /// never releases it; the caller then gives up after this bound and solves,
-/// which is the old behaviour plus 10 ms, and can still never hang.
+/// and can still never hang. In that case a call costs the solve plus up to
+/// ~20 ms of yielding: the lookup waits, and so does the store, which is
+/// skipped entirely once a lookup has timed out (no point waiting twice on
+/// a lock that has no owner).
 const MEMO_PATIENCE: Duration = Duration::from_millis(10);
 
 /// `MEMO`, retried for at most [`MEMO_PATIENCE`]. `None` means "treat as a
@@ -92,7 +95,9 @@ static SOLVES: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
 /// of the same shape, or saving, used to pay it again. See [`MEMO`] for
 /// why the memo is never taken with a blocking `lock()`.
 pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
+    let mut lookup_timed_out = true;
     if let Some(memo) = memo_lock() {
+        lookup_timed_out = false;
         if let Some(hit) = memo.as_ref().and_then(|m| m.get(&(bits, dim))) {
             return hit.clone();
         }
@@ -104,7 +109,7 @@ pub(crate) fn codebook(bits: usize, dim: usize) -> (Vec<f32>, Vec<f32>) {
     #[cfg(test)]
     SOLVES.lock().unwrap_or_else(|e| e.into_inner()).push((bits, dim));
     let computed = lloyd_max(bits, dim, 200, 1e-12);
-    if let Some(mut memo) = memo_lock() {
+    if let Some(mut memo) = if lookup_timed_out { MEMO.try_lock().ok() } else { memo_lock() } {
         memo.get_or_insert_with(HashMap::new)
             .insert((bits, dim), computed.clone());
     }
@@ -342,10 +347,42 @@ mod fork_safety_tests {
         );
     }
 
+    /// Fork carry #6, deterministic: a lookup of a WARM shape that finds the
+    /// lock briefly held (2 ms, far inside `MEMO_PATIENCE`) must wait for it
+    /// and hit the memo. The old single `try_lock` treated it as a miss and
+    /// re-solved, every time.
+    #[test]
+    fn warm_lookup_waits_for_a_briefly_held_lock() {
+        let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+        let shape = (2usize, 1777usize); // used by no other test
+        let _ = super::codebook(shape.0, shape.1); // warm
+        let solves = || {
+            super::SOLVES
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .filter(|&&s| s == shape)
+                .count()
+        };
+        let before = solves();
+        let held = MEMO.lock().unwrap_or_else(|e| e.into_inner());
+        let lookup = std::thread::spawn(move || super::codebook(shape.0, shape.1));
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        drop(held);
+        lookup.join().expect("lookup thread");
+        assert_eq!(
+            solves() - before,
+            0,
+            "a warm lookup that found the memo lock briefly held re-solved instead of waiting"
+        );
+    }
+
     /// Fork carry #6: concurrent lookups of a WARM shape must all be memo
     /// hits. Before the bounded retry, a lookup that lost the `try_lock`
     /// race re-solved (25-100 ms); 8 threads x 40 rounds re-solved this shape
-    /// dozens of times. Counted, not timed.
+    /// 11 times in one run on an 8-core laptop. Counted, not timed, but it
+    /// depends on the threads actually colliding, so on a 1-2 core machine
+    /// the old code can pass it; the deterministic test above cannot.
     #[test]
     fn warm_codebook_is_never_resolved_under_contention() {
         use std::sync::{Arc, Barrier};
