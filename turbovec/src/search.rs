@@ -10,6 +10,37 @@
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
+/// `vpdpbusd`: per i32 lane, `src + sum of four (a as u8) * (b as i8)`.
+///
+/// pg_turbovec fork carry #5. Normally this is exactly stdarch's
+/// `_mm512_dpbusd_epi32`. Under `cfg(turbovec_dpbusd_asm)` -- set by build.rs
+/// for a compiler whose stdarch binds LLVM 22's intrinsic signature but which
+/// links LLVM < 22 (e.g. nixpkgs' rustc on LLVM 21), where the intrinsic does
+/// not compile -- the same instruction is emitted through inline asm. Callers
+/// must have `avx512f` and `avx512vnni` enabled.
+#[cfg(target_arch = "x86_64")]
+macro_rules! dpbusd {
+    ($src:expr, $a:expr, $b:expr $(,)?) => {{
+        #[cfg(not(turbovec_dpbusd_asm))]
+        let r = ::core::arch::x86_64::_mm512_dpbusd_epi32($src, $a, $b);
+        #[cfg(turbovec_dpbusd_asm)]
+        let r = {
+            let mut acc: ::core::arch::x86_64::__m512i = $src;
+            let (a, b): (::core::arch::x86_64::__m512i, ::core::arch::x86_64::__m512i) = ($a, $b);
+            // Intel syntax: acc += dot4(a: u8, b: i8), the intrinsic's order.
+            ::core::arch::asm!(
+                "vpdpbusd {acc}, {a}, {b}",
+                acc = inout(zmm_reg) acc,
+                a = in(zmm_reg) a,
+                b = in(zmm_reg) b,
+                options(pure, nomem, nostack, preserves_flags),
+            );
+            acc
+        };
+        r
+    }};
+}
+
 use rayon::prelude::*;
 
 /// Block-count threshold above which a single unmasked query scans in
@@ -1461,12 +1492,12 @@ unsafe fn search_multi_query_vnni<const PF: bool, const NQ: usize>(
                     let tp = lut_ptrs[qi].add(q4 * 128);
                     let tlo = _mm512_loadu_si512(tp as *const __m512i);
                     let thi = _mm512_loadu_si512(tp.add(64) as *const __m512i);
-                    acc[qi][h] = _mm512_dpbusd_epi32(
+                    acc[qi][h] = dpbusd!(
                         acc[qi][h],
                         _mm512_permutexvar_epi8(ilo, tlo),
                         ones,
                     );
-                    acc[qi][h] = _mm512_dpbusd_epi32(
+                    acc[qi][h] = dpbusd!(
                         acc[qi][h],
                         _mm512_permutexvar_epi8(ihi, thi),
                         ones,
@@ -1617,10 +1648,10 @@ unsafe fn search_single_query_vnni_blk2(
                 let i1lo = _mm512_or_si512(_mm512_and_si512(c1, m0f), kpos);
                 let i1hi = _mm512_or_si512(
                     _mm512_and_si512(_mm512_srli_epi16(c1, 4), m0f), kpos);
-                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0lo, tlo), ones);
-                a0[h] = _mm512_dpbusd_epi32(a0[h], _mm512_permutexvar_epi8(i0hi, thi), ones);
-                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1lo, tlo), ones);
-                a1[h] = _mm512_dpbusd_epi32(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
+                a0[h] = dpbusd!(a0[h], _mm512_permutexvar_epi8(i0lo, tlo), ones);
+                a0[h] = dpbusd!(a0[h], _mm512_permutexvar_epi8(i0hi, thi), ones);
+                a1[h] = dpbusd!(a1[h], _mm512_permutexvar_epi8(i1lo, tlo), ones);
+                a1[h] = dpbusd!(a1[h], _mm512_permutexvar_epi8(i1hi, thi), ones);
             }
         }
 
@@ -1653,8 +1684,8 @@ unsafe fn search_single_query_vnni_blk2(
                     let ilo = _mm512_or_si512(_mm512_and_si512(c, m0f), kpos);
                     let ihi = _mm512_or_si512(
                         _mm512_and_si512(_mm512_srli_epi16(c, 4), m0f), kpos);
-                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ilo, tlo), ones);
-                    a[h] = _mm512_dpbusd_epi32(a[h], _mm512_permutexvar_epi8(ihi, thi), ones);
+                    a[h] = dpbusd!(a[h], _mm512_permutexvar_epi8(ilo, tlo), ones);
+                    a[h] = dpbusd!(a[h], _mm512_permutexvar_epi8(ihi, thi), ones);
                 }
             }
             let base_vec = b * BLOCK;
@@ -1837,8 +1868,8 @@ macro_rules! define_permute_dot {
                     let wp = pds[qi].weights.as_ptr().add(q4 * 8);
                     let wlo = _mm512_set1_epi32((wp as *const i32).read_unaligned());
                     let whi = _mm512_set1_epi32((wp.add(4) as *const i32).read_unaligned());
-                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vlo, wlo);
-                    acc[qi][h] = _mm512_dpbusd_epi32(acc[qi][h], vhi, whi);
+                    acc[qi][h] = dpbusd!(acc[qi][h], vlo, wlo);
+                    acc[qi][h] = dpbusd!(acc[qi][h], vhi, whi);
                 }
               }
             }
@@ -5491,7 +5522,7 @@ unsafe fn exact4_sum_avx512(e: &Exact4, sign: &[u8], low: &[u8], nsg: usize, v: 
         // takes the bias back out. Padding weights are zero.
         let lv = _mm512_shuffle_epi8(levels, codes);
         let w = _mm512_loadu_si512(e.w.as_ptr().add(c * 8) as *const __m512i);
-        acc = _mm512_dpbusd_epi32(acc, lv, w);
+        acc = dpbusd!(acc, lv, w);
         c += 8;
     }
     _mm512_reduce_add_epi32(acc).wrapping_add(e.zero)
@@ -7415,6 +7446,73 @@ mod gate_tests {
                     assert_eq!(a8[dst + r * 8 + j], pd.weights[q4 * 8 + 4 + slot], "even dim, oct {q8} row {r} j {j}");
                     assert_eq!(a8[dst + 16 + r * 8 + j], pd.weights[q4 * 8 + slot], "odd dim, oct {q8} row {r} j {j}");
                 }
+            }
+        }
+    }
+}
+
+/// Fork carry #5 guard: the inline-asm `vpdpbusd` (`dpbusd!` under
+/// `cfg(turbovec_dpbusd_asm)`) must be bit-identical to stdarch's
+/// `_mm512_dpbusd_epi32` and to the scalar definition, including i32
+/// wrap-around and the u8 x i8 extremes. Runs only on an AVX-512 VNNI host;
+/// build with `TURBOVEC_DPBUSD_ASM=1` on an LLVM 22 compiler to compare the
+/// asm path against the scalar reference there.
+#[cfg(all(test, target_arch = "x86_64"))]
+mod dpbusd_carry_tests {
+    use std::arch::x86_64::*;
+
+    #[target_feature(enable = "avx512f,avx512bw,avx512vnni")]
+    unsafe fn via_macro(s: __m512i, a: __m512i, b: __m512i) -> __m512i {
+        dpbusd!(s, a, b)
+    }
+
+    #[test]
+    fn dpbusd_matches_the_scalar_definition() {
+        if !(is_x86_feature_detected!("avx512f")
+            && is_x86_feature_detected!("avx512bw")
+            && is_x86_feature_detected!("avx512vnni"))
+        {
+            eprintln!("skipping: host lacks AVX-512 VNNI");
+            return;
+        }
+        let mut st = 0x9E37_79B9_7F4A_7C15u64;
+        let mut next = || {
+            st ^= st << 13;
+            st ^= st >> 7;
+            st ^= st << 17;
+            st
+        };
+        for t in 0..50_000u32 {
+            let mut buf = [[0u8; 64]; 3];
+            for row in buf.iter_mut() {
+                for x in row.iter_mut() {
+                    *x = next() as u8;
+                }
+            }
+            if t % 7 == 0 {
+                buf[1] = [0xFF; 64]; // u8 max ...
+                buf[2] = [0x80; 64]; // ... times i8 min
+            }
+            if t % 11 == 0 {
+                buf[0] = [0xFF; 64];
+                for l in 0..16 {
+                    buf[0][l * 4 + 3] = 0x7F; // src = i32::MAX: forces a wrap
+                }
+            }
+            let got: [u8; 64] = unsafe {
+                let s = _mm512_loadu_si512(buf[0].as_ptr() as *const __m512i);
+                let a = _mm512_loadu_si512(buf[1].as_ptr() as *const __m512i);
+                let b = _mm512_loadu_si512(buf[2].as_ptr() as *const __m512i);
+                std::mem::transmute(via_macro(s, a, b))
+            };
+            for l in 0..16 {
+                let mut want = i32::from_le_bytes(buf[0][l * 4..l * 4 + 4].try_into().unwrap());
+                for j in 0..4 {
+                    let (u, i) = (buf[1][l * 4 + j] as i32, buf[2][l * 4 + j] as i8 as i32);
+                    want = want.wrapping_add(u * i);
+                }
+                let have = i32::from_le_bytes(got[l * 4..l * 4 + 4].try_into().unwrap());
+                assert_eq!(have, want, "trial {t} lane {l}");
             }
         }
     }
