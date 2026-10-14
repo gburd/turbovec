@@ -51,9 +51,9 @@ type Memo = Option<HashMap<(usize, usize), (Vec<f32>, Vec<f32>)>>;
 /// no longer exists (the inherited-across-`fork` case in [`MEMO`]'s doc)
 /// never releases it; the caller then gives up after this bound and solves,
 /// and can still never hang. In that case a call costs the solve plus up to
-/// ~20 ms of yielding: the lookup waits, and so does the store, which is
-/// skipped entirely once a lookup has timed out (no point waiting twice on
-/// a lock that has no owner).
+/// ~10 ms of yielding: only the lookup waits; once it has timed out, the
+/// store is a single `try_lock` (no point waiting twice on a lock that has
+/// no owner).
 const MEMO_PATIENCE: Duration = Duration::from_millis(10);
 
 /// `MEMO`, retried for at most [`MEMO_PATIENCE`]. `None` means "treat as a
