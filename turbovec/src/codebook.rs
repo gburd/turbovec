@@ -366,7 +366,15 @@ mod fork_safety_tests {
         };
         let before = solves();
         let held = MEMO.lock().unwrap_or_else(|e| e.into_inner());
-        let lookup = std::thread::spawn(move || super::codebook(shape.0, shape.1));
+        // Handshake: the lookup thread must be running (so it meets the
+        // held lock) before the 2 ms countdown starts, or a late-starting
+        // thread would find the lock free and let the old code pass.
+        let (started_tx, started_rx) = std::sync::mpsc::channel();
+        let lookup = std::thread::spawn(move || {
+            started_tx.send(()).expect("handshake");
+            super::codebook(shape.0, shape.1)
+        });
+        started_rx.recv().expect("lookup thread started");
         std::thread::sleep(std::time::Duration::from_millis(2));
         drop(held);
         lookup.join().expect("lookup thread");
