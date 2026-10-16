@@ -68,6 +68,7 @@ pub mod convert;
 pub mod io;
 mod io_v7;
 pub mod pack;
+pub mod prepared;
 pub mod rotation;
 pub mod search;
 pub mod warning;
@@ -83,6 +84,9 @@ mod planes_tests;
 
 pub use error::{AddError, CalibrateError, ConstructError, FromPartsError, SearchError};
 pub use id_map::{IdMapIndex, IdSearchResults};
+pub use prepared::{
+    search_from_prepared, try_search_from_prepared, PiImage, PreparedView, PreparedViewError,
+};
 pub use warning::{set_warning_hook, WarningHook};
 
 use std::path::Path;
