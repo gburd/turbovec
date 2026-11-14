@@ -11,6 +11,25 @@ appears under each surface it touches.
 
 ## [Unreleased]
 
+### Added (Rust crate)
+
+- **`cluster` module: deterministic Euclidean k-means (Lloyd + e-means).**
+  A new general vector-clustering primitive the crate previously lacked
+  (the existing `codebook` Lloyd-Max is a one-dimensional scalar
+  quantizer, a different problem). `cluster_lloyd` is a classic
+  k-means++-seeded Lloyd baseline; `cluster_emeans` is the mini-batch
+  exponential-moving-average solver of Bessa et al. ("e-means:
+  outperforming k-means in one-tenth the epochs", Meta FAIR, arXiv
+  2611.09501, 2026), with the paper's cosine-annealed step, automatic
+  batch/step scaling laws, dead-cluster revival, and last-epoch-mean
+  finalisation. Both are bit-for-bit deterministic in a supplied seed
+  (seeded RNG, fixed-order f64 reductions) so a caller may persist the
+  centroids and gate on equality. Measured on synthetic Gaussian
+  mixtures at IVF-coarse scale (n=100k-205k, k=256-1024, d=32-128):
+  e-means at 4 epochs is 4.5-5.3x faster than Lloyd-at-25-iterations,
+  at equal or lower loss in most configurations.
+
+
 ## turbovec 1.1.2 (Python package) + turbovec 1.1.2 (Rust crate) — 2026-10-06
 
 The staged search that 1.1.0 made the default lost recall on embeddings

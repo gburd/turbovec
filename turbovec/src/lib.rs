@@ -61,6 +61,7 @@
 compile_error!("turbovec requires a 64-bit target (target_pointer_width = \"64\")");
 
 pub mod codebook;
+pub mod cluster;
 pub mod encode;
 pub mod error;
 pub mod id_map;
