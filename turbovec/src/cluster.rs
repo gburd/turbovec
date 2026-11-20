@@ -46,6 +46,7 @@
 
 use rand::{Rng, SeedableRng};
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 
 /// The result of a clustering run.
 #[derive(Clone, Debug)]
@@ -330,7 +331,7 @@ fn revive_dead_clusters(
     // ONCE (O(batch * k), not per dead cluster -- the per-dead rescan
     // was O(dead * batch * k) and dominated the whole run at large k).
     let mut cov: Vec<(f32, usize)> = batch
-        .iter()
+        .par_iter()
         .map(|&i| {
             let x = &sample[i * dim..(i + 1) * dim];
             let mut nd = f32::INFINITY;
@@ -507,10 +508,20 @@ pub fn cluster_emeans_tuned(
             let alpha = alpha0 * (0.1 + 0.9 * cos);
 
             // Batch statistics: s_j, n_j over the batch's assigned points.
+            // The nearest-centroid search is the dominant cost (O(bs * k *
+            // dim)); run it across the rayon build pool. Each point's
+            // assignment is an independent pure function of the point and the
+            // (now fixed) centroids, so the parallel result is identical to a
+            // serial scan. The f64 accumulation below then runs in the exact
+            // batch order, so the EMA statistics stay bit-identical to the
+            // serial implementation (f64 addition is not associative).
+            let batch = &order[off..off + bs];
+            let assign: Vec<usize> =
+                batch.par_iter().map(|&i| nearest(row(i), &centroids, k, dim)).collect();
             let mut bs_counts = vec![0.0f64; k];
             let mut bs_sums = vec![0.0f64; k * dim];
-            for &i in &order[off..off + bs] {
-                let j = nearest(row(i), &centroids, k, dim);
+            for (pos, &i) in batch.iter().enumerate() {
+                let j = assign[pos];
                 bs_counts[j] += 1.0;
                 let s = &mut bs_sums[j * dim..(j + 1) * dim];
                 let r = row(i);
@@ -653,8 +664,11 @@ mod tests {
 
     #[test]
     fn emeans_determinism_independent_of_rayon_pool() {
-        // The solver is single-threaded by construction, but assert the
-        // output does not depend on the ambient rayon pool size either.
+        // The batch assignment runs on the ambient rayon pool; assert the
+        // output does not depend on its size. A one-thread pool runs the
+        // assignment in order (identical to a serial scan), so equality
+        // with an eight-thread pool also proves the parallel assignment is
+        // bit-identical to the serial one.
         let (s, n) = make_blobs(4, 300, 8, 40.0);
         let run = || cluster_emeans(&s, n, 4, 8, 4, 7).centroids;
         let p1 = rayon::ThreadPoolBuilder::new()
